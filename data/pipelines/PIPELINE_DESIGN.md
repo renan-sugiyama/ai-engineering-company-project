@@ -225,9 +225,26 @@ Prefect task retries are safe because source extraction is read-only and the loa
 - **`reporting_database` connection block:** PostgreSQL connection that owns the `reporting` schema and the four approved output/audit tables. Use write credentials scoped to those reporting objects only; if source and destination share a database instance, retain distinct reader and writer credentials. Store credentials in a separate `Secret` block.
 - **`support_source_health` configuration block:** Provider-neutral URL/identifier and polling configuration for the user-approved external support producer/ingestion health signal. If the monitor is authenticated, store its token in a `Secret` block. Its source/provider is not present in the repository; wire it before claiming source silence can be distinguished from true zero activity.
 - **Schedule and timezone:** Configure the Prefect deployment for cron `0 6 * * 1` with timezone `Europe/Madrid`. Keep this non-secret schedule in deployment configuration and pass the period bounds into `support_performance_flow`; use the same flow for manual/backfill runs.
+- **Deployment prerequisite:** No Prefect deployment, work pool, worker, or scheduler configuration currently exists in this repository. Do not treat the schedule above as active until the runtime owner selects/provisions the Prefect server/work pool and configures the deployment with the approved database secrets.
 - **Alert credentials:** If deployment notifications use a webhook/email provider, store the token/connection in a Prefect `Secret` or provider connection block. The provider is not specified here; do not hard-code credentials or invent a vendor.
 
 No object-storage block is needed for v1 because task outputs are recomputed from the source rather than relying on durable in-memory artifacts. The PostgreSQL advisory lock remains a database coordination primitive, not a credential/configuration block.
+
+## CLI Invocation and Schedule
+
+From the repository root, install `data/pipelines/requirements.txt` and configure `TELEMETRY_READ_DATABASE_URL` and `REPORTING_DATABASE_URL` through the local/deployment secret manager. Run the default flow with:
+
+```bash
+python data/pipelines/pipeline.py
+```
+
+To run an explicit completed week or backfill, provide both timezone-aware ISO-8601 bounds and the trigger source:
+
+```bash
+python data/pipelines/pipeline.py --period-start 2026-10-25T23:00:00Z --period-end 2026-11-01T23:00:00Z --trigger-source backfill
+```
+
+The intended recurring deployment is Monday at 06:00 in `Europe/Madrid` (`0 6 * * 1`), processing the preceding completed week and its four-week lookback. The CLI runs once and exits; it is not itself a scheduler. The repository has no approved Prefect server/work pool or deployment configuration, so an operator must provision the deployment and its schedule before unattended runs can be enabled.
 
 ## Reporting Service Endpoint Contracts
 
