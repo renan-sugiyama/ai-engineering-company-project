@@ -585,6 +585,210 @@ def _rate(numerator: int, denominator: int) -> float | None:
     return 100.0 * numerator / denominator
 
 
+def _validate_normalized_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        raise EventValidationError("invalid_events")
+
+    validated_by_event_id: dict[str, dict[str, Any]] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            raise EventValidationError("invalid_event")
+        event_type = event.get("event_type")
+        if event_type not in EVENT_TYPES:
+            continue
+        properties = event.get("properties")
+        if not isinstance(properties, dict):
+            raise EventValidationError("invalid_properties")
+        tags = dict(properties)
+        tags["event_id"] = event.get("event_id")
+        normalized = _validate_source_record(
+            {
+                "event_type": event_type,
+                "timestamp": event.get("timestamp"),
+                "tags": tags,
+            }
+        )
+        prior = validated_by_event_id.get(normalized["event_id"])
+        if prior is not None and prior != normalized:
+            raise EventValidationError("conflicting_event_id")
+        validated_by_event_id[normalized["event_id"]] = normalized
+    return list(validated_by_event_id.values())
+
+
+def _validate_metric_events(
+    events: list[dict[str, Any]],
+    event_type: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        raise EventValidationError("invalid_events")
+    selected_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise EventValidationError("invalid_event")
+        if event.get("event_type") == event_type:
+            selected_events.append(event)
+    return _validate_normalized_events(selected_events)
+
+
+def calculate_sla_attainment(ticket_events: list[dict[str, Any]]) -> dict[str, Any]:
+    tickets = _validate_metric_events(ticket_events, "support_ticket_resolved")
+    resolved_count = len(tickets)
+    sla_met_count = sum(event["properties"]["slaMet"] for event in tickets)
+    return {
+        "sla_met_ticket_count": sla_met_count,
+        "resolved_ticket_count": resolved_count,
+        "sla_attainment_rate": _rate(sla_met_count, resolved_count),
+        "sla_attainment_status": "ok" if resolved_count else "no_data",
+    }
+
+
+def calculate_average_resolution_time(
+    ticket_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    tickets = _validate_metric_events(ticket_events, "support_ticket_resolved")
+    resolution_seconds = [
+        event["properties"]["resolutionSeconds"]
+        for event in tickets
+        if isinstance(event["properties"].get("resolutionSeconds"), (int, float))
+        and not isinstance(event["properties"].get("resolutionSeconds"), bool)
+        and isfinite(event["properties"]["resolutionSeconds"])
+        and event["properties"]["resolutionSeconds"] >= 0
+    ]
+    resolution_sum = sum(resolution_seconds)
+    sample_count = len(resolution_seconds)
+    average_seconds = resolution_sum / sample_count if sample_count else None
+    return {
+        "resolution_time_sum_seconds": resolution_sum,
+        "resolution_sample_count": sample_count,
+        "average_resolution_seconds": average_seconds,
+        "average_resolution_hours": average_seconds / 3600 if average_seconds is not None else None,
+        "resolution_time_status": "ok" if sample_count else "no_data",
+    }
+
+
+def calculate_eligible_query_automation_resolution(
+    query_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    queries = _validate_metric_events(query_events, "support_query_closed")
+    eligible_queries = [
+        event for event in queries if event["properties"]["eligibleForAutomation"]
+    ]
+    bot_resolved_count = sum(
+        event["properties"]["resolved"]
+        and event["properties"]["resolutionMethod"] == "bot"
+        for event in eligible_queries
+    )
+    eligible_count = len(eligible_queries)
+    return {
+        "bot_resolved_eligible_query_count": bot_resolved_count,
+        "eligible_query_count": eligible_count,
+        "automation_resolution_rate": _rate(bot_resolved_count, eligible_count),
+        "automation_resolution_status": "ok" if eligible_count else "no_data",
+    }
+
+
+def calculate_week_end_support_backlog(
+    queue_events: list[dict[str, Any]],
+    period: dict[str, datetime],
+) -> dict[str, Any]:
+    normalized_period = _normalize_period(period)
+    period_start = normalized_period["period_start"]
+    period_end = normalized_period["period_end"]
+    snapshots = _validate_metric_events(queue_events, "support_queue_snapshot_recorded")
+    queue_ids = sorted({event["properties"]["queueId"] for event in snapshots})
+    queue_rows: list[dict[str, Any]] = []
+    lineage: list[dict[str, Any]] = []
+    quality_issues: dict[str, int] = {}
+
+    for queue_id in queue_ids:
+        candidates = [
+            event
+            for event in snapshots
+            if event["properties"]["queueId"] == queue_id
+            and _event_business_time(event) <= period_end
+        ]
+        if not candidates:
+            queue_rows.append(
+                {
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "queue_id": queue_id,
+                    "open_ticket_count": None,
+                    "overdue_ticket_count": None,
+                    "unassigned_ticket_count": None,
+                    "active_agent_count": None,
+                    "oldest_open_age_seconds": None,
+                    "snapshot_at": None,
+                    "snapshot_age_seconds": None,
+                    "freshness_status": "missing",
+                }
+            )
+            continue
+
+        latest_time = max(_event_business_time(event) for event in candidates)
+        latest_events = [
+            event for event in candidates if _event_business_time(event) == latest_time
+        ]
+        if len(latest_events) != 1:
+            quality_issues["ambiguous_queue_snapshot"] = (
+                quality_issues.get("ambiguous_queue_snapshot", 0) + 1
+            )
+            selected_snapshot = None
+        else:
+            selected_snapshot = latest_events[0]
+
+        if selected_snapshot is None:
+            queue_rows.append(
+                {
+                    "period_start": period_start.isoformat(),
+                    "period_end": period_end.isoformat(),
+                    "queue_id": queue_id,
+                    "open_ticket_count": None,
+                    "overdue_ticket_count": None,
+                    "unassigned_ticket_count": None,
+                    "active_agent_count": None,
+                    "oldest_open_age_seconds": None,
+                    "snapshot_at": latest_time.isoformat(),
+                    "snapshot_age_seconds": int((period_end - latest_time).total_seconds()),
+                    "freshness_status": "ambiguous",
+                }
+            )
+            continue
+
+        snapshot_time = _event_business_time(selected_snapshot)
+        snapshot_age = max(0, int((period_end - snapshot_time).total_seconds()))
+        properties = selected_snapshot["properties"]
+        snapshot_is_fresh = snapshot_age <= QUEUE_FRESHNESS_SECONDS
+        queue_rows.append(
+            {
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "queue_id": queue_id,
+                "open_ticket_count": properties["openTicketCount"] if snapshot_is_fresh else None,
+                "overdue_ticket_count": properties["overdueTicketCount"] if snapshot_is_fresh else None,
+                "unassigned_ticket_count": properties["unassignedTicketCount"] if snapshot_is_fresh else None,
+                "active_agent_count": properties["activeAgentCount"] if snapshot_is_fresh else None,
+                "oldest_open_age_seconds": properties["oldestOpenAgeSeconds"] if snapshot_is_fresh else None,
+                "snapshot_at": snapshot_time.isoformat(),
+                "snapshot_age_seconds": snapshot_age,
+                "freshness_status": "fresh" if snapshot_is_fresh else "stale",
+            }
+        )
+        if snapshot_is_fresh:
+            lineage.append(
+                {
+                    "event_id": selected_snapshot["event_id"],
+                    "event_type": selected_snapshot["event_type"],
+                    "event_timestamp": selected_snapshot["timestamp"],
+                    "period_start": period_start.isoformat(),
+                    "output_table": "reporting.support_queue_weekly",
+                    "output_key": f"{period_start.isoformat()}:{queue_id}",
+                }
+            )
+
+    return {"queue_rows": queue_rows, "lineage": lineage, "quality_issues": quality_issues}
+
+
 def _canonical_json_value(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -619,19 +823,10 @@ def transform_support_metrics(
     periods: list[dict[str, datetime]],
 ) -> dict[str, Any]:
     normalized_periods = [_normalize_period(period) for period in periods]
-    valid_events = [
-        event
-        for event in events
-        if event.get("event_type") in EVENT_TYPES
-        and isinstance(event.get("event_id"), str)
-        and isinstance(event.get("properties"), dict)
-    ]
+    valid_events = _validate_normalized_events(events)
     queue_events = [
         event for event in valid_events if event["event_type"] == "support_queue_snapshot_recorded"
     ]
-    observed_queue_ids = sorted(
-        {event["properties"]["queueId"] for event in queue_events}
-    )
 
     performance_rows: list[dict[str, Any]] = []
     queue_rows: list[dict[str, Any]] = []
@@ -685,57 +880,17 @@ def transform_support_metrics(
                 continue
             selected_queries.append(latest_events[0])
 
-        resolved_ticket_count = len(selected_tickets)
-        sla_met_ticket_count = sum(
-            event["properties"]["slaMet"] for event in selected_tickets
-        )
-        resolution_seconds = [
-            event["properties"]["resolutionSeconds"]
-            for event in selected_tickets
-            if isinstance(event["properties"].get("resolutionSeconds"), (int, float))
-            and not isinstance(event["properties"].get("resolutionSeconds"), bool)
-            and isfinite(event["properties"]["resolutionSeconds"])
-            and event["properties"]["resolutionSeconds"] >= 0
-        ]
-        resolution_sum = sum(resolution_seconds)
-        resolution_count = len(resolution_seconds)
-        average_seconds = resolution_sum / resolution_count if resolution_count else None
-
-        eligible_queries = [
-            event
-            for event in selected_queries
-            if event["properties"]["eligibleForAutomation"]
-        ]
-        bot_resolved_queries = sum(
-            event["properties"]["resolved"]
-            and event["properties"]["resolutionMethod"] == "bot"
-            for event in eligible_queries
-        )
+        sla_metrics = calculate_sla_attainment(selected_tickets)
+        resolution_metrics = calculate_average_resolution_time(selected_tickets)
+        automation_metrics = calculate_eligible_query_automation_resolution(selected_queries)
 
         performance_rows.append(
             {
                 "period_start": period_start.isoformat(),
                 "period_end": period_end.isoformat(),
-                "sla_met_ticket_count": sla_met_ticket_count,
-                "resolved_ticket_count": resolved_ticket_count,
-                "sla_attainment_rate": _rate(sla_met_ticket_count, resolved_ticket_count),
-                "sla_attainment_status": "ok" if resolved_ticket_count else "no_data",
-                "resolution_time_sum_seconds": resolution_sum,
-                "resolution_sample_count": resolution_count,
-                "average_resolution_seconds": average_seconds,
-                "average_resolution_hours": (
-                    average_seconds / 3600 if average_seconds is not None else None
-                ),
-                "resolution_time_status": "ok" if resolution_count else "no_data",
-                "bot_resolved_eligible_query_count": bot_resolved_queries,
-                "eligible_query_count": len(eligible_queries),
-                "automation_resolution_rate": _rate(
-                    bot_resolved_queries,
-                    len(eligible_queries),
-                ),
-                "automation_resolution_status": (
-                    "ok" if eligible_queries else "no_data"
-                ),
+                **sla_metrics,
+                **resolution_metrics,
+                **automation_metrics,
             }
         )
 
@@ -750,6 +905,11 @@ def transform_support_metrics(
                     "output_key": period_start.isoformat(),
                 }
             )
+        eligible_queries = [
+            event
+            for event in selected_queries
+            if event["properties"]["eligibleForAutomation"]
+        ]
         for event in eligible_queries:
             lineage.append(
                 {
@@ -762,94 +922,11 @@ def transform_support_metrics(
                 }
             )
 
-        period_snapshots: dict[str, list[dict[str, Any]]] = {
-            queue_id: [] for queue_id in observed_queue_ids
-        }
-        for event in queue_events:
-            event_time = _event_business_time(event)
-            if event_time <= period_end:
-                period_snapshots[event["properties"]["queueId"]].append(event)
-
-        for queue_id in observed_queue_ids:
-            candidates = period_snapshots[queue_id]
-            if not candidates:
-                queue_rows.append(
-                    {
-                        "period_start": period_start.isoformat(),
-                        "period_end": period_end.isoformat(),
-                        "queue_id": queue_id,
-                        "open_ticket_count": None,
-                        "overdue_ticket_count": None,
-                        "unassigned_ticket_count": None,
-                        "active_agent_count": None,
-                        "oldest_open_age_seconds": None,
-                        "snapshot_at": None,
-                        "snapshot_age_seconds": None,
-                        "freshness_status": "missing",
-                    }
-                )
-                continue
-
-            latest_time = max(_event_business_time(event) for event in candidates)
-            latest_events = [
-                event for event in candidates if _event_business_time(event) == latest_time
-            ]
-            if len(latest_events) != 1:
-                quality_issues["ambiguous_queue_snapshot"] = (
-                    quality_issues.get("ambiguous_queue_snapshot", 0) + 1
-                )
-                selected_snapshot = None
-            else:
-                selected_snapshot = latest_events[0]
-
-            if selected_snapshot is None:
-                queue_rows.append(
-                    {
-                        "period_start": period_start.isoformat(),
-                        "period_end": period_end.isoformat(),
-                        "queue_id": queue_id,
-                        "open_ticket_count": None,
-                        "overdue_ticket_count": None,
-                        "unassigned_ticket_count": None,
-                        "active_agent_count": None,
-                        "oldest_open_age_seconds": None,
-                        "snapshot_at": latest_time.isoformat(),
-                        "snapshot_age_seconds": int((period_end - latest_time).total_seconds()),
-                        "freshness_status": "ambiguous",
-                    }
-                )
-                continue
-
-            snapshot_time = _event_business_time(selected_snapshot)
-            snapshot_age = max(0, int((period_end - snapshot_time).total_seconds()))
-            properties = selected_snapshot["properties"]
-            snapshot_is_fresh = snapshot_age <= QUEUE_FRESHNESS_SECONDS
-            queue_rows.append(
-                {
-                    "period_start": period_start.isoformat(),
-                    "period_end": period_end.isoformat(),
-                    "queue_id": queue_id,
-                    "open_ticket_count": properties["openTicketCount"] if snapshot_is_fresh else None,
-                    "overdue_ticket_count": properties["overdueTicketCount"] if snapshot_is_fresh else None,
-                    "unassigned_ticket_count": properties["unassignedTicketCount"] if snapshot_is_fresh else None,
-                    "active_agent_count": properties["activeAgentCount"] if snapshot_is_fresh else None,
-                    "oldest_open_age_seconds": properties["oldestOpenAgeSeconds"] if snapshot_is_fresh else None,
-                    "snapshot_at": snapshot_time.isoformat(),
-                    "snapshot_age_seconds": snapshot_age,
-                    "freshness_status": "fresh" if snapshot_is_fresh else "stale",
-                }
-            )
-            if snapshot_is_fresh:
-                lineage.append(
-                    {
-                        "event_id": selected_snapshot["event_id"],
-                        "event_type": selected_snapshot["event_type"],
-                        "event_timestamp": selected_snapshot["timestamp"],
-                        "period_start": period_start.isoformat(),
-                        "output_table": "reporting.support_queue_weekly",
-                        "output_key": f"{period_start.isoformat()}:{queue_id}",
-                    }
-                )
+        queue_result = calculate_week_end_support_backlog(queue_events, period)
+        queue_rows.extend(queue_result["queue_rows"])
+        lineage.extend(queue_result["lineage"])
+        for issue, count in queue_result["quality_issues"].items():
+            quality_issues[issue] = quality_issues.get(issue, 0) + count
 
         source_counts.append(
             {
@@ -1138,6 +1215,69 @@ def write_optional_eval_snapshot(
     return str(artifact_path)
 
 
+@flow(name="support_event_extraction_flow")
+def support_event_extraction_flow(
+    periods: list[dict[str, datetime]],
+) -> dict[str, Any]:
+    extraction_state = extract_support_events(periods, return_state=True)
+    return _require_completed_task_state(extraction_state, "extract_support_events")
+
+
+@flow(name="support_kpi_transformation_flow")
+def support_kpi_transformation_flow(
+    events: list[dict[str, Any]],
+    periods: list[dict[str, datetime]],
+) -> dict[str, Any]:
+    transformation_state = transform_support_metrics(
+        events,
+        periods,
+        return_state=True,
+    )
+    return _require_completed_task_state(
+        transformation_state,
+        "transform_support_metrics",
+    )
+
+
+@flow(name="support_performance_publication_flow")
+def support_performance_publication_flow(
+    transformed: dict[str, Any],
+    periods: list[dict[str, datetime]],
+    run_id: str,
+) -> dict[str, Any]:
+    comparison_state = identify_changed_reporting_periods(
+        transformed,
+        periods,
+        return_state=True,
+    )
+    comparison = _require_completed_task_state(
+        comparison_state,
+        "identify_changed_reporting_periods",
+    )
+    changed_transformed = _only_changed_periods(
+        transformed,
+        comparison["changed_period_starts"],
+    )
+    load_state = load_reporting_partitions(
+        changed_transformed,
+        run_id,
+        return_state=True,
+    )
+    loaded = _require_completed_task_state(load_state, "load_reporting_partitions")
+    return {
+        "changed_period_starts": comparison["changed_period_starts"],
+        "rows_written": loaded["rows_written"],
+    }
+
+
+@flow(name="support_evaluation_snapshot_flow")
+def support_evaluation_snapshot_flow(
+    transformed: dict[str, Any],
+    run_id: str,
+) -> str:
+    return write_optional_eval_snapshot(transformed, run_id)
+
+
 @flow(name="support_performance_flow")
 def support_performance_flow(
     period_start: datetime | None = None,
@@ -1168,7 +1308,10 @@ def support_performance_flow(
             last_checkpoint = "started"
 
             current_phase = "extract"
-            extraction_state = extract_support_events(periods, return_state=True)
+            extraction_state = support_event_extraction_flow(
+                periods,
+                return_state=True,
+            )
             extracted = _require_completed_task_state(
                 extraction_state,
                 "extract_support_events",
@@ -1195,7 +1338,7 @@ def support_performance_flow(
             last_checkpoint = "extract_complete"
 
             current_phase = "transform"
-            transformation_state = transform_support_metrics(
+            transformation_state = support_kpi_transformation_flow(
                 extracted["events"],
                 periods,
                 return_state=True,
@@ -1221,28 +1364,17 @@ def support_performance_flow(
             _require_completed_task_state(progress_state, "record_pipeline_run_progress")
             last_checkpoint = "transform_complete"
 
-            current_phase = "compare_lineage"
-            comparison_state = identify_changed_reporting_periods(
+            current_phase = "publish"
+            publication_state = support_performance_publication_flow(
                 transformed,
                 periods,
-                return_state=True,
-            )
-            comparison = _require_completed_task_state(
-                comparison_state,
-                "identify_changed_reporting_periods",
-            )
-            changed_transformed = _only_changed_periods(
-                transformed,
-                comparison["changed_period_starts"],
-            )
-
-            current_phase = "load"
-            load_state = load_reporting_partitions(
-                changed_transformed,
                 run_id,
                 return_state=True,
             )
-            loaded = _require_completed_task_state(load_state, "load_reporting_partitions")
+            published = _require_completed_task_state(
+                publication_state,
+                "support_performance_publication_flow",
+            )
 
             terminal_state = record_pipeline_run_terminal_state(
                 run_id,
@@ -1255,12 +1387,12 @@ def support_performance_flow(
                 "record_pipeline_run_terminal_state",
             )
 
-            optional_state = write_optional_eval_snapshot(
+            optional_state = support_evaluation_snapshot_flow(
                 transformed,
                 run_id,
                 return_state=True,
             )
-            _warn_if_optional_task_failed(optional_state, "write_optional_eval_snapshot")
+            _warn_if_optional_task_failed(optional_state, "support_evaluation_snapshot_flow")
 
             return {
                 "run_id": run_id,
@@ -1268,8 +1400,8 @@ def support_performance_flow(
                 "records_read": extracted["records_read"],
                 "records_processed": extracted["records_processed"],
                 "records_rejected": extracted["records_rejected"],
-                "rows_written": loaded["rows_written"],
-                "changed_periods": comparison["changed_period_starts"],
+                "rows_written": published["rows_written"],
+                "changed_periods": published["changed_period_starts"],
                 "source_health_status": "unknown",
                 "quality_issues": transformed["quality_issues"],
             }

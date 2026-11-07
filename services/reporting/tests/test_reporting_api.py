@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
+from services.reporting.app.auth import authenticate_internal_user, require_reporting_operator
+from services.reporting.app.asgi import app as reporting_host_app
 from services.reporting.app.main import create_reporting_app
 
 UTC = timezone.utc
@@ -212,3 +215,69 @@ class ReportingApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertNotIn("private period details", response.text)
+
+
+class ReportingAuthTests(unittest.TestCase):
+    @patch("services.reporting.app.auth.httpx.Client")
+    def test_authentication_validates_bearer_session_with_auth_service(self, client_factory) -> None:
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.post.return_value.status_code = 200
+        client.post.return_value.json.return_value = {"userId": "support-user"}
+        client_factory.return_value = client
+
+        principal = authenticate_internal_user(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials="session-token")
+        )
+
+        self.assertEqual(principal, {"userId": "support-user"})
+        client_factory.assert_called_once_with(timeout=5.0, follow_redirects=False)
+        client.post.assert_called_once_with(
+            "http://127.0.0.1:8003/login",
+            headers={"Authorization": "Bearer session-token"},
+        )
+
+    def test_missing_bearer_session_is_rejected(self) -> None:
+        with self.assertRaises(HTTPException) as error:
+            authenticate_internal_user(None)
+
+        self.assertEqual(error.exception.status_code, 401)
+
+    @patch.dict("os.environ", {"REPORTING_OPERATOR_USER_IDS": "operator-1,operator-2"})
+    def test_operator_allowlist_requires_an_explicit_auth_service_user_id(self) -> None:
+        self.assertEqual(
+            require_reporting_operator({"userId": "operator-1"}),
+            {"userId": "operator-1"},
+        )
+        with self.assertRaises(HTTPException) as error:
+            require_reporting_operator({"userId": "support-user"})
+
+        self.assertEqual(error.exception.status_code, 403)
+
+    @patch.dict("os.environ", {"REPORTING_OPERATOR_USER_IDS": ""})
+    def test_unconfigured_operator_allowlist_fails_closed(self) -> None:
+        with self.assertRaises(HTTPException) as error:
+            require_reporting_operator({"userId": "support-user"})
+
+        self.assertEqual(error.exception.status_code, 503)
+
+    @patch("services.reporting.app.main.query_support_performance_kpis")
+    def test_asgi_kpi_route_uses_validated_auth_service_identity(self, query_kpis) -> None:
+        reporting_host_app.dependency_overrides[authenticate_internal_user] = (
+            lambda: {"userId": "support-user"}
+        )
+        query_kpis.return_value = {
+            "period_timezone": "Europe/Madrid",
+            "sla_attainment": {"numerator": 1, "denominator": 1, "rate_percent": 100.0},
+        }
+        try:
+            response = TestClient(reporting_host_app).get(
+                "/reporting/kpis",
+                headers={"Authorization": "Bearer validated-session"},
+            )
+        finally:
+            reporting_host_app.dependency_overrides.clear()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["sla_attainment"]["rate_percent"], 100.0)
+        query_kpis.assert_called_once_with(None, None, None)
