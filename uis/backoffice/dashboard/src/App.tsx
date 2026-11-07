@@ -46,7 +46,7 @@ function App({ data, error }: AppProps) {
             Dashboard
           </a>
           <a href="/telemetry">Technical telemetry</a>
-          <a href="#">Support</a>
+          <a href="/reporting">Support performance</a>
           <a href="#">Sales</a>
           <a href="#">Training</a>
           <a href="#">HR</a>

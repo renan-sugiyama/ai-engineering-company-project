@@ -20,8 +20,12 @@ export function authRequest(path: "/login" | "/logout", init: RequestInit) {
   });
 }
 
+export async function getSessionToken(): Promise<string | null> {
+  return (await cookies()).get(SESSION_COOKIE)?.value ?? null;
+}
+
 export async function getSession(): Promise<AuthSession | null> {
-  const token = (await cookies()).get(SESSION_COOKIE)?.value;
+  const token = await getSessionToken();
   if (!token) return null;
 
   try {
